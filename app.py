@@ -2,14 +2,14 @@ import os
 import tempfile
 import streamlit as st
 
-# dotenv optional import
+# ─────── 환경 변수 로드 ───────
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
 
-# import PDF loader 유연하게 처리
+# ─────── 안전한 PyPDFLoader 임포트 ───────
 try:
     from langchain_community.document_loaders import PyPDFLoader
 except ModuleNotFoundError:
@@ -26,7 +26,7 @@ from langchain.chat_models import ChatOpenAI
 from langchain.schema import Document
 from googleapiclient.discovery import build
 
-# ───────── 환경 변수 로드 ─────────
+# ─────── 환경 변수 로딩 ───────
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
@@ -36,17 +36,17 @@ if not OPENAI_API_KEY:
 if not GOOGLE_API_KEY or not GOOGLE_CSE_ID:
     st.error("환경변수 GOOGLE_API_KEY 또는 GOOGLE_CSE_ID가 설정되지 않았습니다.")
 
-# ───────── PDF → Document 리스트 ─────────
+# ─────── PDF 로딩 및 분할 ───────
 def load_and_split_pdf(file_path: str):
     if PyPDFLoader is None:
-        st.error("PDF 기능 사용 시 'pypdf'와 'langchain-community' 설치 필요")
+        st.error("PDF 기능 사용을 위해 'pypdf' 및 'langchain-community' 패키지가 필요합니다.")
         st.stop()
     loader = PyPDFLoader(file_path)
     pages = loader.load_and_split()
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
     return splitter.split_documents(pages)
 
-# ───────── 웹검색 → Document 리스트 ─────────
+# ─────── Google 웹 검색 문서 변환 ───────
 def web_search_docs(query: str, num_results: int = 5):
     service = build("customsearch", "v1", developerKey=GOOGLE_API_KEY)
     res = service.cse().list(q=query, cx=GOOGLE_CSE_ID, num=num_results).execute()
@@ -60,7 +60,7 @@ def web_search_docs(query: str, num_results: int = 5):
         docs.append(Document(page_content=content, metadata={"source": link}))
     return docs
 
-# ───────── QA 체인 생성 ─────────
+# ─────── QA 체인 생성 ───────
 def setup_qa_chain(documents, model_name: str = "gpt-4"):
     vector_store = FAISS.from_documents(documents, OpenAIEmbeddings())
     llm = ChatOpenAI(model=model_name, openai_api_key=OPENAI_API_KEY)
@@ -72,14 +72,14 @@ def setup_qa_chain(documents, model_name: str = "gpt-4"):
         return_source_documents=True
     )
 
-# ───────── rerun 호환성 처리 ─────────
+# ─────── rerun 처리 ───────
 def rerun():
     if hasattr(st, "rerun"):
         st.rerun()
     else:
         st.experimental_rerun()
 
-# ───────── Streamlit 앱 ─────────
+# ─────── Streamlit 앱 실행 ───────
 def run_app():
     st.set_page_config(page_title="회원가입 고객상담 챗봇", page_icon="🤖", layout="wide")
 
@@ -89,11 +89,9 @@ def run_app():
     """, unsafe_allow_html=True)
 
     st.sidebar.header("⚙️ 설정")
-    st.sidebar.markdown("FAQ PDF 업로드 및 웹검색 질문 기능 제공")
 
     if "history" not in st.session_state:
         st.session_state.history = []
-
     if "uploaded_file" not in st.session_state:
         st.session_state.uploaded_file = None
 
