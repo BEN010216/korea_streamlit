@@ -1,112 +1,193 @@
 import os
-import streamlit as st
-from dotenv import load_dotenv
-from pathlib import Path
 import tempfile
+import streamlit as st
 
-from langchain.document_loaders import PyPDFLoader
+# dotenv optional import
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+# import PDF loader 유연하게 처리
+try:
+    from langchain_community.document_loaders import PyPDFLoader
+except ModuleNotFoundError:
+    try:
+        from langchain.document_loaders.pdf import PyPDFLoader
+    except ModuleNotFoundError:
+        PyPDFLoader = None
+
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.vectorstores import FAISS
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain.chains import create_history_aware_retriever, create_retrieval_chain
-from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain_community.chat_message_histories.streamlit import StreamlitChatMessageHistory
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.chains import RetrievalQA
+from langchain.chat_models import ChatOpenAI
+from langchain.schema import Document
+from googleapiclient.discovery import build
 
-# .env에서 API 키 로드
-load_dotenv()
+# ───────── 환경 변수 로드 ─────────
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
 
-# ✅ PDF 로딩 함수
-def load_and_split_pdf(file_path):
-    loader = PyPDFLoader(file_path)
-    return loader.load_and_split()
+if not OPENAI_API_KEY:
+    st.error("환경변수 OPENAI_API_KEY가 설정되지 않았습니다.")
+if not GOOGLE_API_KEY or not GOOGLE_CSE_ID:
+    st.error("환경변수 GOOGLE_API_KEY 또는 GOOGLE_CSE_ID가 설정되지 않았습니다.")
 
-# ✅ FAISS 벡터스토어 생성
-def create_vector_store(_docs):
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
-    split_docs = text_splitter.split_documents(_docs)
-    embeddings = OpenAIEmbeddings(model='text-embedding-3-small')
-    vectorstore = FAISS.from_documents(split_docs, embeddings)
-    return vectorstore
-
-# ✅ 체인 초기화 함수 (업로드 파일 받도록 수정)
-def initialize_components(selected_model, uploaded_file):
-    if uploaded_file is None:
-        st.warning("📎 PDF 파일을 업로드해 주세요.")
+# ───────── PDF → Document 리스트 ─────────
+def load_and_split_pdf(file_path: str):
+    if PyPDFLoader is None:
+        st.error("PDF 기능 사용 시 'pypdf'와 'langchain-community' 설치 필요")
         st.stop()
+    loader = PyPDFLoader(file_path)
+    pages = loader.load_and_split()
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
+    return splitter.split_documents(pages)
 
-    # 파일을 임시 경로에 저장
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-        tmp_file.write(uploaded_file.read())
-        file_path = tmp_file.name
+# ───────── 웹검색 → Document 리스트 ─────────
+def web_search_docs(query: str, num_results: int = 5):
+    service = build("customsearch", "v1", developerKey=GOOGLE_API_KEY)
+    res = service.cse().list(q=query, cx=GOOGLE_CSE_ID, num=num_results).execute()
+    items = res.get("items", [])
+    docs = []
+    for item in items:
+        title = item.get("title", "")
+        snippet = item.get("snippet", "")
+        link = item.get("link", "")
+        content = f"{title}\n{snippet}"
+        docs.append(Document(page_content=content, metadata={"source": link}))
+    return docs
 
-    st.info(f"📄 불러온 파일: {uploaded_file.name}")  # 디버깅용 파일 이름 표시
-    pages = load_and_split_pdf(file_path)
-    vectorstore = create_vector_store(pages)
-    retriever = vectorstore.as_retriever()
+# ───────── QA 체인 생성 ─────────
+def setup_qa_chain(documents, model_name: str = "gpt-4"):
+    vector_store = FAISS.from_documents(documents, OpenAIEmbeddings())
+    llm = ChatOpenAI(model=model_name, openai_api_key=OPENAI_API_KEY)
+    retriever = vector_store.as_retriever()
+    return RetrievalQA.from_chain_type(
+        llm=llm,
+        retriever=retriever,
+        chain_type="stuff",
+        return_source_documents=True
+    )
 
-    # 프롬프트 설정
-    contextualize_q_prompt = ChatPromptTemplate.from_messages([
-        ("system", "Given a chat history and the latest user question "
-                   "which might reference context in the chat history, "
-                   "formulate a standalone question."),
-        MessagesPlaceholder("history"),
-        ("human", "{input}")
-    ])
+# ───────── rerun 호환성 처리 ─────────
+def rerun():
+    if hasattr(st, "rerun"):
+        st.rerun()
+    else:
+        st.experimental_rerun()
 
-    qa_prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are a helpful AI answering based on the following documents.\n"
-                   "If you don’t know, just say so.\n"
-                   "답변은 한국어로, 존댓말을 사용하세요. 이모지도 넣어줘요.\n\n{context}"),
-        MessagesPlaceholder("history"),
-        ("human", "{input}")
-    ])
+# ───────── Streamlit 앱 ─────────
+def run_app():
+    st.set_page_config(page_title="회원가입 고객상담 챗봇", page_icon="🤖", layout="wide")
 
-    llm = ChatOpenAI(model=selected_model)
-    history_aware_retriever = create_history_aware_retriever(llm, retriever, contextualize_q_prompt)
-    question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
-    rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
-    return rag_chain
+    st.markdown("""
+        <h1 style="text-align:center; color:#6C63FF;">📚 회원가입 고객상담 챗봇</h1>
+        <p style="text-align:center;">업로드한 <strong>PDF FAQ</strong>와 <strong>웹검색</strong>을 통해 답변을 제공합니다.</p>
+    """, unsafe_allow_html=True)
 
-# ✅ Streamlit 실행 메인 함수
-def main():
-    st.set_page_config(page_title="헌법 Q&A", page_icon="📘")
-    st.header("헌법 Q&A 챗봇 💬📚")
+    st.sidebar.header("⚙️ 설정")
+    st.sidebar.markdown("FAQ PDF 업로드 및 웹검색 질문 기능 제공")
 
-    # 파일 업로드 UI
-    uploaded_file = st.file_uploader("📎 PDF 파일 업로드", type="pdf")
+    if "history" not in st.session_state:
+        st.session_state.history = []
 
-    model_option = st.selectbox("🤖 GPT 모델 선택", ("gpt-4o", "gpt-3.5-turbo"))
-    if uploaded_file:
-        rag_chain = initialize_components(model_option, uploaded_file)
-        chat_history = StreamlitChatMessageHistory(key="chat_messages")
+    if "uploaded_file" not in st.session_state:
+        st.session_state.uploaded_file = None
 
-        conversational_rag_chain = RunnableWithMessageHistory(
-            rag_chain,
-            lambda session_id: chat_history,
-            input_messages_key="input",
-            history_messages_key="history",
-            output_messages_key="answer",
-        )
+    st.sidebar.subheader("📄 FAQ PDF 업로드")
+    uploaded = st.sidebar.file_uploader("PDF 업로드", type=["pdf"])
+    if uploaded:
+        st.session_state.uploaded_file = uploaded
+        st.sidebar.success("📁 파일 업로드 완료!")
 
-        if "messages" not in st.session_state:
-            st.session_state["messages"] = [{"role": "assistant", "content": "헌법에 대해 무엇이든 물어보세요!"}]
+    st.markdown("### ❓ 질문 입력")
+    query = st.text_input("질문을 입력하세요", value="", key="query_input")
 
-        for msg in chat_history.messages:
-            st.chat_message(msg.type).write(msg.content)
+    if st.button("🤔 질문하기"):
+        actual_query = query.strip()
+        pdf_answer = None
+        pdf_sources = []
 
-        if prompt := st.chat_input("질문을 입력하세요"):
-            st.chat_message("human").write(prompt)
-            with st.chat_message("ai"):
-                with st.spinner("GPT가 답변 중입니다..."):
-                    config = {"configurable": {"session_id": "user_session"}}
-                    response = conversational_rag_chain.invoke({"input": prompt}, config)
-                    st.write(response["answer"])
-                    with st.expander("📄 참고 문서"):
-                        for doc in response["context"]:
-                            st.markdown(doc.metadata.get("source", "출처 없음"), help=doc.page_content)
+        if actual_query:
+            if st.session_state.uploaded_file:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                    tmp.write(st.session_state.uploaded_file.read())
+                    tmp_path = tmp.name
 
-# ✅ 실행 시작점
+                pdf_docs = load_and_split_pdf(tmp_path)
+                pdf_chain = setup_qa_chain(pdf_docs)
+                pdf_res = pdf_chain.invoke({"query": actual_query})
+                pdf_answer = pdf_res.get("result", "").strip()
+                pdf_sources = pdf_res.get("source_documents", [])
+
+            st.session_state.history.append({
+                "query": actual_query,
+                "pdf_answer": pdf_answer,
+                "pdf_sources": pdf_sources,
+                "web_answer": None,
+                "web_sources": [],
+                "web_searched": False
+            })
+
+            rerun()
+
+    if st.session_state.history:
+        st.markdown("## 📜 이전 질문")
+        for i, qa in enumerate(st.session_state.history):
+            with st.container():
+                st.markdown(f"### ❓ 질문 {i+1}: `{qa['query']}`")
+
+                with st.expander("📄 PDF 기반 답변 보기"):
+                    if qa["pdf_answer"]:
+                        st.success(qa["pdf_answer"])
+                    else:
+                        st.info("PDF 기반 답변 없음.")
+
+                if qa["web_searched"]:
+                    with st.expander("🌐 웹검색 기반 답변 보기"):
+                        if qa["web_answer"]:
+                            st.warning(qa["web_answer"])
+                        else:
+                            st.info("웹검색 답변 없음.")
+                        st.markdown("📑 **참고 자료:**")
+                        for doc in qa["web_sources"]:
+                            url = doc.metadata.get("source", "")
+                            st.markdown(f"- 🌍 [출처]({url})")
+
+                if not qa["web_searched"]:
+                    if st.button(f"🌐 웹검색 답변 - 질문 {i+1}", key=f"web_search_{i}"):
+                        web_docs = web_search_docs(qa["query"])
+                        web_chain = setup_qa_chain(web_docs)
+                        web_res = web_chain.invoke({"query": qa["query"]})
+                        qa["web_answer"] = web_res.get("result", "").strip()
+                        qa["web_sources"] = web_res.get("source_documents", [])
+                        qa["web_searched"] = True
+                        rerun()
+
+    if st.sidebar.button("🧹 업로드 초기화"):
+        st.session_state.uploaded_file = None
+        rerun()
+
+    st.markdown("---")
+    st.markdown("## 🔍 웹검색 전용")
+    web_query = st.text_input("웹에서 검색할 질문을 입력하세요", key="web_query_input")
+    if st.button("🌐 웹검색만 하기", key="web_search_direct"):
+        if web_query.strip():
+            with st.spinner("웹에서 정보를 수집 중입니다..."):
+                web_docs = web_search_docs(web_query.strip())
+                web_chain = setup_qa_chain(web_docs)
+                web_res = web_chain.invoke({"query": web_query.strip()})
+
+                st.markdown("### 🌐 웹검색 답변:")
+                st.code(web_res.get("result", "").strip(), language="markdown")
+
+                st.markdown("### 📑 참고 자료:")
+                for doc in web_res.get("source_documents", []):
+                    url = doc.metadata.get("source", "")
+                    st.markdown(f"- 🌍 [참고 자료]({url})")
+
 if __name__ == "__main__":
-    main()
+    run_app()
