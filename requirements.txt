@@ -1,6 +1,7 @@
 streamlit
 openai
-langchain
+langchain>=0.0.308
+langchain-community
 faiss-cpu
 pypdf
 google-api-python-client
